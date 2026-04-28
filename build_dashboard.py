@@ -176,6 +176,41 @@ def build_dataset(quarters, records):
     for q, inds in by_ind.items():
         by_ind_plain[q] = {ind: v for ind, v in inds.items()}
 
+    # ── 加仓幅度三分位（按季度内 fcc>0 的股票三等分）────────────────────
+    # tier: 'L'低加仓 / 'M'中加仓 / 'H'高加仓 / 'R'减仓 / 'N'持平
+    for q in quarters:
+        recs = by_quarter[q]
+        fcc_pos = sorted([r['fcc'] for r in recs
+                          if r.get('fcc') is not None and r['fcc'] > 0])
+        if len(fcc_pos) >= 3:
+            t33 = fcc_pos[len(fcc_pos) // 3]
+            t66 = fcc_pos[2 * len(fcc_pos) // 3]
+        else:
+            t33 = t66 = float('inf')
+        for r in recs:
+            fcc = r.get('fcc')
+            if fcc is None:       r['tier'] = 'N'
+            elif fcc < 0:         r['tier'] = 'R'
+            elif fcc == 0:        r['tier'] = 'N'
+            elif fcc <= t33:      r['tier'] = 'L'
+            elif fcc <= t66:      r['tier'] = 'M'
+            else:                 r['tier'] = 'H'
+
+    # ── 行业平均 fw（占基金持仓比重），用于判断行业低配 ─────────────────
+    ind_avg_fw = {}   # {q: {ind: avg_fw}}
+    for q in quarters:
+        bucket = {}
+        for r in by_quarter[q]:
+            ind = r.get('ind', '其他')
+            fw  = r.get('fw')
+            if fw is not None:
+                bucket.setdefault(ind, []).append(fw)
+        ind_avg_fw[q] = {ind: round(sum(v) / len(v), 6)
+                         for ind, v in bucket.items()}
+        # 写回每条记录
+        for r in by_quarter[q]:
+            r['ifw'] = ind_avg_fw[q].get(r.get('ind', '其他'))
+
     return {
         'quarters': quarters,
         'by_quarter': {q: by_quarter[q] for q in quarters},
@@ -276,6 +311,18 @@ tr:hover td{background:var(--accent-sub) !important}
 .code-cell{color:var(--accent);font-family:var(--mono);font-size:11px;font-weight:500}
 .rank{color:var(--text-3);font-size:11px;font-family:var(--mono)}
 .ind-tag{display:inline-block;background:var(--accent-sub);color:var(--accent);padding:2px 7px;border-radius:4px;font-size:11px;font-family:var(--ui);font-weight:600}
+/* 加仓三分位标签 */
+.tier{display:inline-block;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;font-family:var(--ui);margin-left:4px;vertical-align:middle}
+.tier-L{background:#eef3fc;color:#1e50a2}
+.tier-M{background:#f5f5f5;color:#96a0ae}
+.tier-H{background:#fff3e0;color:#c07000}
+.tier-R{background:#fdf2f1;color:#c0392b}
+/* 行业低配标签 */
+.ifw-low{display:inline-block;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;font-family:var(--ui);background:#f0f8f3;color:#166534;margin-left:3px;vertical-align:middle}
+.ifw-ref{font-size:9.5px;color:var(--text-3);font-family:var(--mono);display:block;margin-top:1px}
+/* 减仓行提示 */
+tr.jianc-row td{background:#fff8f7!important}
+tr.jianc-row:hover td{background:#fdf2f1!important}
 
 /* ── Charts ── */
 .chart-box{background:var(--bg-card);border:1px solid var(--bd);border-radius:var(--r);padding:14px 16px;box-shadow:var(--sh-sm)}
@@ -336,6 +383,12 @@ tr:hover td{background:var(--accent-sub) !important}
     </select>
     <span class="ctrl-lbl">行业</span>
     <select id="t1-ind" style="min-width:90px"></select>
+    <span class="ctrl-lbl">配置</span>
+    <select id="t1-ifw">
+      <option value="">全部</option>
+      <option value="low">行业低配</option>
+      <option value="high">行业高配</option>
+    </select>
     <span class="ctrl-lbl">显示</span>
     <select id="t1-top">
       <option value="50">Top 50</option>
@@ -359,7 +412,7 @@ tr:hover td{background:var(--accent-sub) !important}
           <th onclick="t1Sort('fw')">占基金持仓</th>
           <th onclick="t1Sort('fwd')" title="较上季度变动（百分点）">环比变动(pp)</th>
           <th onclick="t1Sort('fc')">持有基金数</th>
-          <th onclick="t1Sort('fcc')">本季增减</th>
+          <th onclick="t1Sort('fcc')">本季增减 / 信号</th>
         </tr>
       </thead>
       <tbody id="t1-body"></tbody>
@@ -586,8 +639,11 @@ function renderT1() {
   const sortBy = document.getElementById('t1-sort').value;
   const topN = parseInt(document.getElementById('t1-top').value);
   const indFilter = document.getElementById('t1-ind').value;
+  const ifwFilter = document.getElementById('t1-ifw').value;
   let rows = (DATA.by_quarter[q] || []).slice();
   if (indFilter) rows = rows.filter(r => r.ind === indFilter);
+  if (ifwFilter === 'low')  rows = rows.filter(r => r.fw != null && r.ifw != null && r.fw < r.ifw);
+  if (ifwFilter === 'high') rows = rows.filter(r => r.fw != null && r.ifw != null && r.fw >= r.ifw);
 
   // 计算 fw 环比变动（百分点）
   const qIdx = qs.indexOf(q);
@@ -634,10 +690,41 @@ function renderT1() {
 
   const top = rows.slice(0, topN);
   const tbody = document.getElementById('t1-body');
+
+  // 加仓三分位标签配置
+  const TIER_CFG = {
+    L: ['tier-L', '低加仓'],
+    M: ['tier-M', '中加仓'],
+    H: ['tier-H', '高加仓⚠'],
+    R: ['tier-R', '减仓⚠'],
+    N: ['tier-M', '持平'],
+  };
+
   tbody.innerHTML = top.map((r, i) => {
-    const fccCls = clsInt(r.fcc);
-    const vcCls  = clsPct(r.vc);
-    return `<tr>
+    const fccCls  = clsInt(r.fcc);
+    const vcCls   = clsPct(r.vc);
+    const isJianc = r.fcc != null && r.fcc < 0;
+
+    // 占基金持仓 + 行业均值
+    let fwCell = '—';
+    if (r.fw != null) {
+      const fwPct  = (r.fw * 100).toFixed(3) + '%';
+      const ifwPct = r.ifw != null ? (r.ifw * 100).toFixed(3) + '%' : null;
+      const isLow  = r.ifw != null && r.fw < r.ifw;
+      const lowBadge = isLow ? '<span class="ifw-low" title="低于行业平均配置">低配</span>' : '';
+      const ifwRef   = ifwPct ? `<span class="ifw-ref">行业均 ${ifwPct}</span>` : '';
+      fwCell = `${fwPct}${lowBadge}${ifwRef}`;
+    }
+
+    // 本季增减 + 三分位标签
+    let fccCell = '—';
+    if (r.fcc != null) {
+      const tier = r.tier || 'N';
+      const [tCls, tLbl] = TIER_CFG[tier] || TIER_CFG['N'];
+      fccCell = `${sign(r.fcc)}${r.fcc}<span class="tier ${tCls}">${tLbl}</span>`;
+    }
+
+    return `<tr class="${isJianc ? 'jianc-row' : ''}">
       <td class="l rank">${i+1}</td>
       <td class="l code-cell">${r.code}</td>
       <td class="l">${r.name}</td>
@@ -645,10 +732,10 @@ function renderT1() {
       <td>${fmt(r.pv)}</td>
       <td class="${vcCls}">${r.vc != null ? sign(r.vc)+fmt(r.vc) : '—'}</td>
       <td>${r.fp != null ? (r.fp*100).toFixed(2)+'%' : '—'}</td>
-      <td>${r.fw != null ? (r.fw*100).toFixed(3)+'%' : '—'}</td>
+      <td class="l">${fwCell}</td>
       <td class="${clsPct(r.fwd)}">${r.fwd != null ? sign(r.fwd)+r.fwd.toFixed(3)+'pp' : '—'}</td>
       <td>${r.fc != null ? r.fc : '—'}</td>
-      <td class="${fccCls}">${r.fcc != null ? sign(r.fcc)+r.fcc : '—'}</td>
+      <td class="${fccCls} l">${fccCell}</td>
     </tr>`;
   }).join('');
 }
@@ -782,7 +869,14 @@ function renderStockDetail(code, s) {
   const latest = hist[hist.length - 1];
   const prev = hist.length > 1 ? hist[hist.length - 2] : null;
   const fcChg = prev && latest.fc != null && prev.fc != null ? latest.fc - prev.fc : null;
-  document.getElementById('t3-cards').innerHTML = `
+  const latestFcc = latest.fcc;
+  const jianCSignal = latestFcc != null && latestFcc < 0;
+  const jianCHtml = jianCSignal
+    ? `<div style="background:#fdf2f1;border:1px solid #f5c6c2;border-radius:6px;
+        padding:8px 14px;margin-bottom:12px;font-size:12px;color:#c0392b;font-weight:600">
+        ⚠ 减仓信号（${latest.q}）：持有基金数净减少 ${latestFcc} 家，机构正在撤出，建议关注。
+       </div>` : '';
+  document.getElementById('t3-cards').innerHTML = jianCHtml + `
     <div class="card"><div class="ctrl-lbl">代码</div><div class="card-val" style="font-size:16px">${code}</div><div class="card-sub">${s.name} · ${s.ind}</div></div>
     <div class="card"><div class="ctrl-lbl">最新季度</div><div class="card-val" style="font-size:18px">${latest.q}</div></div>
     <div class="card"><div class="ctrl-lbl">持有基金数</div><div class="card-val">${latest.fc??'—'}</div><div class="card-sub ${clsInt(fcChg)}">${fcChg!=null?(sign(fcChg)+fcChg+'家'):'—'}</div></div>
@@ -839,17 +933,23 @@ function renderStockDetail(code, s) {
   t3Charts.push(cfc);
 
   // Table
-  document.getElementById('t3-body').innerHTML = hist.slice().reverse().map(h => `<tr>
+  document.getElementById('t3-body').innerHTML = hist.slice().reverse().map(h => {
+    const isJianc = h.fcc != null && h.fcc < 0;
+    const fccLabel = h.fcc != null
+      ? `${sign(h.fcc)}${h.fcc}${isJianc ? ' <span class="tier tier-R" title="减仓信号">减仓⚠</span>' : ''}`
+      : '—';
+    return `<tr class="${isJianc ? 'jianc-row' : ''}">
     <td class="l"><b>${h.q}</b></td>
     <td>${fmt(h.ep)}</td>
     <td>${h.sh!=null?fmt(h.sh):'—'}</td>
     <td class="${clsPct(h.sch)}">${h.sch!=null?sign(h.sch)+fmt(h.sch):'—'}</td>
     <td>${h.pv!=null?fmt(h.pv):'—'}</td>
     <td><b>${h.fc!=null?h.fc:'—'}</b></td>
-    <td class="${clsInt(h.fcc)}">${h.fcc!=null?sign(h.fcc)+h.fcc:'—'}</td>
+    <td class="${clsInt(h.fcc)} l">${fccLabel}</td>
     <td>${h.fp!=null?(h.fp*100).toFixed(2)+'%':'—'}</td>
     <td class="${clsPct(h.ytd)}">${h.ytd!=null?sign(h.ytd)+fmtPct(h.ytd):'—'}</td>
-  </tr>`).join('');
+  </tr>`;
+  }).join('');
 }
 
 // ── TAB 4: 行业分布 ──────────────────────────────────────────────────
@@ -951,6 +1051,7 @@ function renderT4() {
   populateT1Industries(latestQ);
   document.getElementById('t1-sort').addEventListener('change', () => { t1SortKey = document.getElementById('t1-sort').value; t1SortAsc = false; renderT1(); });
   document.getElementById('t1-ind').addEventListener('change', renderT1);
+  document.getElementById('t1-ifw').addEventListener('change', renderT1);
   document.getElementById('t1-top').addEventListener('change', renderT1);
 
   populateQ('t2-q', renderT2);

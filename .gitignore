@@ -2,3 +2,9 @@
 ~$*
 __pycache__/
 *.pyc
+# 价格数据（文件较大，含敏感数据）
+*日收盘价.csv
+*收盘点位.csv
+# 临时工具脚本
+fix_pp.py
+wind_test.py
